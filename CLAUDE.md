@@ -6,6 +6,29 @@ This file contains technical details, architectural decisions, and important imp
 
 LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions. The key innovation is anonymized peer review in Stage 2, preventing models from playing favorites.
 
+## Project status
+
+Per the README's *Vibe Code Alert*: this is an unmaintained personal hack, not a product. There is no test suite, no CI, no backwards-compat contract. Treat changes as throwaway experiments — favour direct edits over large refactors, and do not introduce frameworks or abstractions the existing code does not already need.
+
+## Commands
+
+**Install**
+- Python: `uv sync` (run from repo root)
+- Frontend: `cd frontend && npm install`
+
+**Run (dev)**
+- Both at once: `./start.sh`
+- Backend only: `uv run python -m backend.main` — serves on port **8001**
+- Frontend only: `cd frontend && npm run dev` — Vite on port 5173
+
+**Frontend build / lint**
+- `cd frontend && npm run build`
+- `cd frontend && npm run lint`
+
+**Tests**: there is no Python test suite. `pyproject.toml` lists no test dependencies and there is no `tests/` directory. Do not invent a pytest invocation.
+
+Note: the `main.py` at the repo root is a `uv init` stub (`print("Hello from llm-council!")`) and is unused. The real entrypoint is `backend/main.py`.
+
 ## Architecture
 
 ### Backend Structure (`backend/`)
@@ -44,6 +67,8 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - FastAPI app with CORS enabled for localhost:5173 and localhost:3000
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
 - Metadata includes: label_to_model mapping and aggregate_rankings
+- POST `/api/conversations/{id}/message/stream` returns Server-Sent Events (`stage1_start`, `stage1_complete`, `stage2_start`, `stage2_complete`, `stage3_start`, `stage3_complete`, `title_complete`, `complete`, `error`). Consumed client-side by `api.sendMessageStream` in `frontend/src/api.js`.
+- The non-streaming POST `/api/conversations/{id}/message` still exists and returns the full result in one shot — keep both endpoints in sync when changing the council flow.
 
 ### Frontend Structure (`frontend/src/`)
 
@@ -135,15 +160,10 @@ Models are hardcoded in `backend/config.py`. Chairman can be same or different f
 ## Future Enhancement Ideas
 
 - Configurable council/chairman via UI instead of config file
-- Streaming responses instead of batch loading
 - Export conversations to markdown/PDF
 - Model performance analytics over time
 - Custom ranking criteria (not just accuracy/insight)
 - Support for reasoning models (o1, etc.) with special handling
-
-## Testing Notes
-
-Use `test_openrouter.py` to verify API connectivity and test different model identifiers before adding to council. The script tests both streaming and non-streaming modes.
 
 ## Data Flow Summary
 

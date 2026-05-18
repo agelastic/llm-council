@@ -2,7 +2,47 @@
 
 from typing import List, Dict, Any, Tuple
 from .openrouter import query_models_parallel, query_model
+from . import config
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+
+
+IDEAS_STAGE2_PROMPT = """You are reviewing different responses to the following question:
+
+Question: {user_query}
+
+Here are the responses from different models (anonymized):
+
+{responses_text}
+
+Your task: extract substantive ideas from these responses and group them.
+
+1. COMMON IDEAS: Ideas, claims, or recommendations that appear in two
+   or more responses. For each common idea, cite which responses
+   contain it (e.g. "Response A, C, D").
+2. UNIQUE IDEAS: Ideas that appear in only one response. Attribute
+   each to its response (e.g. "Response B").
+
+Do not rank the responses. Do not score them. Do not pick a winner.
+Focus on extracting and grouping substantive content."""
+
+
+IDEAS_STAGE3_PROMPT = """You are the Chairman of an LLM Council. Multiple AI models have read a user's question, drafted their own answers, and then each produced an analysis of common and unique ideas across all of those answers. You are given only the per-model analyses (Stage 2), not the original drafts (Stage 1).
+
+Original Question: {user_query}
+
+STAGE 2 - Per-Model Idea Analysis:
+{stage2_text}
+
+Your task as Chairman: review the Stage 2 analyses and produce your own final summary of common and unique points.
+
+1. COMMON IDEAS: Substantive ideas, claims, or recommendations that the
+   Stage 2 analyses agree on. Brief explanation for each.
+2. UNIQUE IDEAS: Ideas raised by only one analysis, attributed to the
+   model that surfaced them.
+
+Do not score or rank. Do not pick a winner. Do not invent ideas not
+present in the Stage 2 analyses. Do not ask follow-up or clarifying
+questions; if anything is ambiguous, state your assumption and proceed."""
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,7 +55,17 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Answer the user's question directly. Do not ask follow-up "
+                "or clarifying questions. If anything is ambiguous, state "
+                "your assumption and proceed."
+            ),
+        },
+        {"role": "user", "content": user_query},
+    ]
 
     # Query all models in parallel
     responses = await query_models_parallel(COUNCIL_MODELS, messages)
@@ -61,7 +111,12 @@ async def stage2_collect_rankings(
         for label, result in zip(labels, stage1_results)
     ])
 
-    ranking_prompt = f"""You are evaluating different responses to the following question:
+    if config.IDEAS_MODE:
+        ranking_prompt = IDEAS_STAGE2_PROMPT.format(
+            user_query=user_query, responses_text=responses_text
+        )
+    else:
+        ranking_prompt = f"""You are evaluating different responses to the following question:
 
 Question: {user_query}
 
@@ -102,7 +157,7 @@ Now provide your evaluation and ranking:"""
     for model, response in responses.items():
         if response is not None:
             full_text = response.get('content', '')
-            parsed = parse_ranking_from_text(full_text)
+            parsed = [] if config.IDEAS_MODE else parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": model,
                 "ranking": full_text,
@@ -139,7 +194,13 @@ async def stage3_synthesize_final(
         for result in stage2_results
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    if config.IDEAS_MODE:
+        chairman_prompt = IDEAS_STAGE3_PROMPT.format(
+            user_query=user_query,
+            stage2_text=stage2_text,
+        )
+    else:
+        chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
 
 Original Question: {user_query}
 
@@ -154,7 +215,7 @@ Your task as Chairman is to synthesize all of this information into a single, co
 - The peer rankings and what they reveal about response quality
 - Any patterns of agreement or disagreement
 
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+Provide a clear, well-reasoned final answer that represents the council's collective wisdom. Do not ask follow-up or clarifying questions; if anything is ambiguous, state your assumption and answer directly:"""
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
@@ -196,8 +257,8 @@ def parse_ranking_from_text(ranking_text: str) -> List[str]:
             # This pattern looks for: number, period, optional space, "Response X"
             numbered_matches = re.findall(r'\d+\.\s*Response [A-Z]', ranking_section)
             if numbered_matches:
-                # Extract just the "Response X" part
-                return [re.search(r'Response [A-Z]', m).group() for m in numbered_matches]
+                # Strip the "N. " prefix to leave "Response X".
+                return [m.split('.', 1)[1].strip() for m in numbered_matches]
 
             # Fallback: Extract all "Response X" patterns in order
             matches = re.findall(r'Response [A-Z]', ranking_section)
@@ -228,14 +289,17 @@ def calculate_aggregate_rankings(
     model_positions = defaultdict(list)
 
     for ranking in stage2_results:
-        ranking_text = ranking['ranking']
-
-        # Parse the ranking from the structured format
-        parsed_ranking = parse_ranking_from_text(ranking_text)
+        evaluator = ranking['model']
+        parsed_ranking = parse_ranking_from_text(ranking['ranking'])
 
         for position, label in enumerate(parsed_ranking, start=1):
             if label in label_to_model:
                 model_name = label_to_model[label]
+                if model_name == evaluator:
+                    # Exclude self-votes: a model ranking its own (anonymized)
+                    # response would inflate its aggregate score via the
+                    # self-preference bias documented in arXiv:2404.13076.
+                    continue
                 model_positions[model_name].append(position)
 
     # Calculate average position for each model
@@ -316,8 +380,12 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     # Stage 2: Collect rankings
     stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
 
-    # Calculate aggregate rankings
-    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+    # Calculate aggregate rankings (skip in ideas mode -- citations like
+    # "Response A, C, D" would otherwise be parsed as fake rankings).
+    aggregate_rankings = (
+        [] if config.IDEAS_MODE
+        else calculate_aggregate_rankings(stage2_results, label_to_model)
+    )
 
     # Stage 3: Synthesize final answer
     stage3_result = await stage3_synthesize_final(
