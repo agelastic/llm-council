@@ -29,6 +29,10 @@ async def query_model(
     payload = {
         "model": model,
         "messages": messages,
+        # OpenRouter silently ignores `reasoning` on models that do not
+        # support it, and maps effort <-> max_tokens for those that use
+        # the other axis. Safe to set globally.
+        "reasoning": {"effort": "medium"},
     }
 
     try:
